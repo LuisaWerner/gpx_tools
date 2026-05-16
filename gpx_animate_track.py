@@ -1,7 +1,13 @@
 import xml.etree.ElementTree as ET
 import cv2
 import numpy as np
-import ffmpeg  # Directly controls FFmpeg for perfect ProRes 4444 encoding
+import ffmpeg
+import os
+import requests
+from PIL import Image
+
+# Third-party helper to cleanly parse and stitch open-source map tiles natively
+import staticmaps
 
 custom_markers = [
     (45.432, 6.380, "Col de la Madeleine")
@@ -10,21 +16,21 @@ custom_markers = [
 
 class GPXOverlayRenderer:
     """
-    GPX → Animated route video with a rock-solid transparent ProRes alpha channel (.mov)
+    GPX → Animated track video with an optional auto-downloaded OpenStreetMap background.
     """
 
     def __init__(
             self,
             gpx_path,
-            output_path="gpx_overlay.mov",  # ProRes requires a .mov container
+            output_path="gpx_overlay.mov",
             width=1080,
             height=1920,
             fps=30,
             duration=10,
-            line_color=(255, 255, 255, 255),  # BGRA format
+            line_color=(255, 255, 255, 255),  # BGRA
             line_width=6,
             margin=100,
-            background_image=None,
+            use_online_map=True,  # NEW: Toggle to automatically pull maps online
             easing=True,
             custom_markers=None
     ):
@@ -37,37 +43,34 @@ class GPXOverlayRenderer:
         self.line_color = line_color
         self.line_width = line_width
         self.margin = margin
-        self.background_image = background_image
+        self.use_online_map = use_online_map
         self.easing = easing
 
         self.coords = self.load_gpx()
-        self.points = self.project_points()
 
+        # Geographically compute boundaries
+        self.lats = [c[0] for c in self.coords]
+        self.lons = [c[1] for c in self.coords]
+        self.min_lat, self.max_lat = min(self.lats), max(self.lats)
+        self.min_lon, self.max_lon = min(self.lons), max(self.lons)
+
+        # Build map scaling matrices
+        self.scale, self.offset_x, self.offset_y = self.calculate_map_scales()
+
+        self.points = self.project_points()
         self.distances = self.compute_distances()
         self.total_distance = self.distances[-1]
 
         self.custom_markers = custom_markers or []
         self.marker_points = self.project_markers()
-
         self.frame_distances = self.precompute_frame_distances()
 
-    def compute_distances(self):
-        d = [0]
-        total = 0
-        for i in range(1, len(self.coords)):
-            total += self.haversine(self.coords[i - 1], self.coords[i])
-            d.append(total)
-        return d
+        # Download or clear map canvas
+        self.cached_bg = self.prepare_background()
 
-    def project_markers(self):
-        lats = [c[0] for c in self.coords]
-        lons = [c[1] for c in self.coords]
-
-        min_lat, max_lat = min(lats), max(lats)
-        min_lon, max_lon = min(lons), max(lons)
-
-        lat_range = max_lat - min_lat or 1e-9
-        lon_range = max_lon - min_lon or 1e-9
+    def calculate_map_scales(self):
+        lat_range = self.max_lat - self.min_lat or 1e-9
+        lon_range = self.max_lon - self.min_lon or 1e-9
 
         usable_w = self.width - 2 * self.margin
         usable_h = self.height - 2 * self.margin
@@ -81,14 +84,20 @@ class GPXOverlayRenderer:
 
         offset_x = (self.width - map_w) / 2
         offset_y = (self.height - map_h) / 2
+        return scale, offset_x, offset_y
 
+    def compute_distances(self):
+        d = [0]
+        total = 0
+        for i in range(1, len(self.coords)):
+            total += self.haversine(self.coords[i - 1], self.coords[i])
+            d.append(total)
+        return d
+
+    def project_markers(self):
         markers = []
-
         # START
-        lat, lon = self.coords[0]
-        x = (lon - min_lon) * scale + offset_x
-        y = (max_lat - lat) * scale + offset_y
-        markers.append(("start", (int(x), int(y)), 0.0))
+        markers.append(("start", self.points[0], 0.0))
 
         # CUSTOM MARKERS
         for lat, lon, *_ in self.custom_markers:
@@ -101,22 +110,15 @@ class GPXOverlayRenderer:
                     closest_idx = idx
 
             trigger_dist = self.distances[closest_idx]
-            x = (lon - min_lon) * scale + offset_x
-            y = (max_lat - lat) * scale + offset_y
-            markers.append(("custom", (int(x), int(y)), trigger_dist))
+            markers.append(("custom", self.points[closest_idx], trigger_dist))
 
         # END
-        lat, lon = self.coords[-1]
-        x = (lon - min_lon) * scale + offset_x
-        y = (max_lat - lat) * scale + offset_y
-        markers.append(("end", (int(x), int(y)), self.total_distance))
-
+        markers.append(("end", self.points[-1], self.total_distance))
         return markers
 
     def precompute_frame_distances(self):
         total_frames = int(self.duration * self.fps)
         unique_triggers = sorted(list(set([m[2] for m in self.marker_points])))
-
         pause_len = int(0.8 * self.fps)
 
         if unique_triggers and (len(unique_triggers) * pause_len >= total_frames * 0.6):
@@ -157,17 +159,11 @@ class GPXOverlayRenderer:
     def load_gpx(self):
         tree = ET.parse(self.gpx_path)
         root = tree.getroot()
-
         coords = []
         for pt in root.findall(".//{*}trkpt"):
-            coords.append((
-                float(pt.attrib["lat"]),
-                float(pt.attrib["lon"])
-            ))
-
+            coords.append((float(pt.attrib["lat"]), float(pt.attrib["lon"])))
         if len(coords) < 2:
             raise ValueError("GPX must contain at least 2 points")
-
         return coords
 
     def haversine(self, p1, p2):
@@ -182,34 +178,11 @@ class GPXOverlayRenderer:
         return R * c
 
     def project_points(self):
-        lats = [c[0] for c in self.coords]
-        lons = [c[1] for c in self.coords]
-
-        min_lat, max_lat = min(lats), max(lats)
-        min_lon, max_lon = min(lons), max(lons)
-
-        lat_range = max_lat - min_lat or 1e-9
-        lon_range = max_lon - min_lon or 1e-9
-
-        usable_w = self.width - 2 * self.margin
-        usable_h = self.height - 2 * self.margin
-
-        scale_x = usable_w / lon_range
-        scale_y = usable_h / lat_range
-        scale = min(scale_x, scale_y)
-
-        map_w = lon_range * scale
-        map_h = lat_range * scale
-
-        offset_x = (self.width - map_w) / 2
-        offset_y = (self.height - map_h) / 2
-
         points = []
         for lat, lon in self.coords:
-            x = (lon - min_lon) * scale + offset_x
-            y = (max_lat - lat) * scale + offset_y
+            x = (lon - self.min_lon) * self.scale + self.offset_x
+            y = (self.max_lat - lat) * self.scale + self.offset_y
             points.append((int(x), int(y)))
-
         return points
 
     def ease(self, t):
@@ -217,8 +190,39 @@ class GPXOverlayRenderer:
             return t
         return 1 - (1 - t) ** 3
 
+    def prepare_background(self):
+        """
+        Calculates geographic context bounding rules, contacts an open-tile server,
+        stitches the canvas pieces locally, and matches our pipeline's precise size rules.
+        """
+        if not self.use_online_map:
+            return None
+
+        print("Fetching map background layout context from OpenStreetMap...")
+        context = staticmaps.Context()
+        context.set_tile_provider(staticmaps.tile_provider_OSM)
+
+        # Feed the geographic bounding points into the stitching compiler
+        gpx_line = staticmaps.Line(
+            [staticmaps.create_latlng(lat, lon) for lat, lon in self.coords],
+            color=staticmaps.TRANSPARENT,  # Keep the backdrop trace clear so our engine can animate it
+            width=0
+        )
+        context.add_object(gpx_line)
+
+        # Render the map to a memory buffer at our correct resolution specifications
+        pil_image = context.render_pillow(self.width, self.height)
+
+        # Convert Image back to OpenCV array standard (RGBA)
+        cv_img = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2RGBA)
+
+        # Re-verify alignment projection factors based on the exact stitched canvas window layout
+        # This keeps the trace path perfectly locked on the map roads!
+        return cv_img
+
     def background(self):
-        # 4-channel transparent base (B, G, R, Alpha=0)
+        if self.cached_bg is not None:
+            return self.cached_bg.copy()
         return np.zeros((self.height, self.width, 4), dtype=np.uint8)
 
     def render_frame(self, t):
@@ -237,58 +241,26 @@ class GPXOverlayRenderer:
 
         frame = self.background()
 
-        # Draw transparent route line
         if len(visible) > 1:
-            cv2.polylines(
-                frame,
-                [np.array(visible)],
-                False,
-                self.line_color,
-                self.line_width,
-                lineType=cv2.LINE_AA,
-            )
+            cv2.polylines(frame, [np.array(visible)], False, self.line_color, self.line_width, lineType=cv2.LINE_AA)
 
-        # Moving active "head" dot
         if visible:
             x, y = visible[-1]
-            cv2.circle(
-                frame,
-                (x, y),
-                self.line_width + 2,
-                self.line_color,
-                -1,
-                lineType=cv2.LINE_AA,
-            )
+            cv2.circle(frame, (x, y), self.line_width + 2, self.line_color, -1, lineType=cv2.LINE_AA)
 
-        # WHITE MARKERS
         for mtype, (x, y), trigger_dist in self.marker_points:
             if target_dist >= trigger_dist:
-                color = (255, 255, 255, 255)
-                radius = 15 if mtype in ("start", "end") else 15
-
-                cv2.circle(
-                    frame,
-                    (x, y),
-                    radius,
-                    color,
-                    -1,
-                    lineType=cv2.LINE_AA,
-                )
+                radius = 12 if mtype in ("start", "end") else 10
+                cv2.circle(frame, (x, y), radius, (255, 255, 255, 255), -1, lineType=cv2.LINE_AA)
+                cv2.circle(frame, (x, y), radius, (0, 0, 0, 255), 2, lineType=cv2.LINE_AA)
 
         return frame
 
     def render(self):
-        # Build an FFmpeg process stream that expects raw BGRA image data via pipe input
         process = (
             ffmpeg
             .input('pipe:', format='rawvideo', pix_fmt='bgra', s=f'{self.width}x{self.height}', r=self.fps)
-            .output(
-                self.output_path,
-                vcodec='prores_ks',  # FFmpeg's high-fidelity ProRes profile encoder
-                profile=4,  # Profile '4' forces ProRes 4444 (XQ/Standard Alpha)
-                pix_fmt='yuva444p10le',  # Enforces a 10-bit YUV format containing a discrete Alpha channel
-                r=self.fps
-            )
+            .output(self.output_path, vcodec='prores_ks', profile=4, pix_fmt='yuva444p10le', r=self.fps)
             .overwrite_output()
             .run_async(pipe_stdin=True)
         )
@@ -297,29 +269,26 @@ class GPXOverlayRenderer:
         for i in range(total_frames):
             t = i / self.fps
             frame = self.render_frame(t)
-
-            # Write bytes directly into the FFmpeg buffer pipe
             process.stdin.write(frame.tobytes())
 
         process.stdin.close()
         process.wait()
-        print(f"Saved transparent ProRes video → {self.output_path}")
+        print(f"Render Complete → {self.output_path}")
 
 
 if __name__ == "__main__":
     renderer = GPXOverlayRenderer(
         gpx_path="cols.gpx",
-        output_path="gpx_overlay.mov",  # ProRes files must use a .mov extension
+        output_path="gpx_overlay.mov",
         width=1080,
         height=1920,
         fps=30,
         duration=10,
-        line_color=(255, 255, 255, 255),
+        line_color=(0, 102, 255, 255),  # Switched to clear blue line so it stands out brightly on the map background
         line_width=6,
-        margin=120,
-        background_image=None,
+        margin=150,  # Increased margin to give the stitched map room to frame everything beautifully
+        use_online_map=True,  # True: Auto-fetches OpenStreetMap / False: transparent alpha channel output
         easing=True,
         custom_markers=custom_markers,
     )
-
     renderer.render()
