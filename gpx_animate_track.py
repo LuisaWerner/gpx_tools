@@ -16,7 +16,7 @@ custom_markers = [
 
 class GPXOverlayRenderer:
     """
-    GPX → Animated track video with an optional auto-downloaded OpenStreetMap background.
+    GPX → Animated track video with an optimized dynamic camera tracking (flyover) effect.
     """
 
     def __init__(
@@ -29,10 +29,11 @@ class GPXOverlayRenderer:
             duration=10,
             line_color=(255, 255, 255, 255),  # BGRA
             line_width=6,
-            margin=100,
-            use_online_map=True,  # Toggle to automatically pull maps online
+            use_online_map=True,
             easing=True,
-            custom_markers=None
+            custom_markers=None,
+            flyover=True,  # Toggle to enable/disable camera tracking flyover
+            flyover_zoom=14  # Fixed high zoom level for close-up tracking (typically 13-16)
     ):
         self.gpx_path = gpx_path
         self.output_path = output_path
@@ -42,9 +43,10 @@ class GPXOverlayRenderer:
         self.duration = duration
         self.line_color = line_color
         self.line_width = line_width
-        self.margin = margin
         self.use_online_map = use_online_map
         self.easing = easing
+        self.flyover = flyover
+        self.flyover_zoom = flyover_zoom
 
         self.coords = self.load_gpx()
 
@@ -52,39 +54,33 @@ class GPXOverlayRenderer:
         self.distances = self.compute_distances()
         self.total_distance = self.distances[-1]
 
-        # Initialize background canvas context to query pixel projection metrics
+        # Use a safe, active tile server asset configuration
+        self.tile_provider = staticmaps.TileProvider(
+            name="carto_dark",
+            url_pattern="https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+            max_zoom=20
+        )
+
+        # FIX: Instantiate cleanly without arguments.
+        # Caching happens automatically in your user home directory.
         self.context = staticmaps.Context()
-        self.context.set_tile_provider(staticmaps.tile_provider_OSM)
+        self.context.set_tile_provider(self.tile_provider)
 
-        # Feed the coordinates to context so it can compute bounds automatically
-        gpx_line = staticmaps.Line(
-            [staticmaps.create_latlng(lat, lon) for lat, lon in self.coords],
-            color=staticmaps.TRANSPARENT,
-            width=0
-        )
-        self.context.add_object(gpx_line)
-
-        # Compute layout metrics using the proper public methods
-        center, zoom = self.context.determine_center_zoom(self.width - 2 * self.margin, self.height - 2 * self.margin)
-
-        # Fix: Fetch tile_size cleanly from the explicit tile provider object
-        self.transformer = staticmaps.Transformer(
-            self.width,
-            self.height,
-            zoom,
-            center,
-            staticmaps.tile_provider_OSM.tile_size()
-        )
-
-        # Map pixel tracks directly using the exact underlying Web Mercator projections
-        self.points = self.project_points()
+        if not self.flyover:
+            gpx_line = staticmaps.Line(
+                [staticmaps.create_latlng(lat, lon) for lat, lon in self.coords],
+                color=staticmaps.TRANSPARENT,
+                width=0
+            )
+            self.context.add_object(gpx_line)
+            center, zoom = self.context.determine_center_zoom(self.width, self.height)
+            self.transformer = staticmaps.Transformer(
+                self.width, self.height, zoom, center, self.tile_provider.tile_size()
+            )
+            self.points = [self.transformer.ll2pixel(staticmaps.create_latlng(lat, lon)) for lat, lon in self.coords]
 
         self.custom_markers = custom_markers or []
-        self.marker_points = self.project_markers()
         self.frame_distances = self.precompute_frame_distances()
-
-        # Cache structural background matrix
-        self.cached_bg = self.prepare_background()
 
     def compute_distances(self):
         d = [0]
@@ -94,38 +90,30 @@ class GPXOverlayRenderer:
             d.append(total)
         return d
 
-    def project_markers(self):
-        markers = []
-        # START
-        markers.append(("start", self.points[0], 0.0))
+    def get_coord_at_distance(self, target_dist):
+        """Finds the interpolation lat/lon position at an exact distance point."""
+        if target_dist <= 0:
+            return self.coords[0]
+        if target_dist >= self.total_distance:
+            return self.coords[-1]
 
-        # CUSTOM MARKERS
-        for lat, lon, *_ in self.custom_markers:
-            closest_idx = 0
-            min_d = float('inf')
-            for idx, coord in enumerate(self.coords):
-                d = self.haversine((lat, lon), coord)
-                if d < min_d:
-                    min_d = d
-                    closest_idx = idx
+        for i, d in enumerate(self.distances):
+            if d >= target_dist:
+                d_prev = self.distances[i - 1]
+                d_next = d
+                segment_pct = (target_dist - d_prev) / (d_next - d_prev or 1e-9)
 
-            trigger_dist = self.distances[closest_idx]
-            markers.append(("custom", self.points[closest_idx], trigger_dist))
+                lat_prev, lon_prev = self.coords[i - 1]
+                lat_next, lon_next = self.coords[i]
 
-        # END
-        markers.append(("end", self.points[-1], self.total_distance))
-        return markers
+                lat = lat_prev + segment_pct * (lat_next - lat_prev)
+                lon = lon_prev + segment_pct * (lon_next - lon_prev)
+                return (lat, lon)
+        return self.coords[-1]
 
     def precompute_frame_distances(self):
         total_frames = int(self.duration * self.fps)
-        unique_triggers = sorted(list(set([m[2] for m in self.marker_points])))
-        pause_len = int(0.8 * self.fps)
-
-        if unique_triggers and (len(unique_triggers) * pause_len >= total_frames * 0.6):
-            pause_len = int((total_frames * 0.5) / len(unique_triggers))
-
-        total_pause_frames = len(unique_triggers) * pause_len
-        moving_frames = max(1, total_frames - total_pause_frames)
+        moving_frames = total_frames
 
         def get_moving_dist(mf):
             if moving_frames <= 1:
@@ -134,27 +122,7 @@ class GPXOverlayRenderer:
             p = self.ease(t_rel)
             return p * self.total_distance
 
-        frame_distances = []
-        mf_idx = 0
-        next_trigger_idx = 0
-
-        while len(frame_distances) < total_frames:
-            if next_trigger_idx < len(unique_triggers):
-                target_trigger = unique_triggers[next_trigger_idx]
-                current_dist_proposal = get_moving_dist(mf_idx)
-
-                if (target_trigger == 0.0 and mf_idx == 0) or (current_dist_proposal >= target_trigger):
-                    actual_pause_frames = min(pause_len, total_frames - len(frame_distances))
-                    for _ in range(actual_pause_frames):
-                        frame_distances.append(target_trigger)
-                    next_trigger_idx += 1
-                    continue
-
-            if len(frame_distances) < total_frames:
-                frame_distances.append(get_moving_dist(mf_idx))
-                mf_idx = min(mf_idx + 1, moving_frames - 1)
-
-        return frame_distances
+        return [get_moving_dist(i) for i in range(total_frames)]
 
     def load_gpx(self):
         tree = ET.parse(self.gpx_path)
@@ -177,66 +145,74 @@ class GPXOverlayRenderer:
         c = 2 * atan2(sqrt(a), sqrt(1 - a))
         return R * c
 
-    def project_points(self):
-        """
-        Uses staticmaps internal mercator transformer to map coordinates to pixels perfectly.
-        """
-        points = []
-        for lat, lon in self.coords:
-            latlng = staticmaps.create_latlng(lat, lon)
-            x, y = self.transformer.ll2pixel(latlng)
-            points.append((int(x), int(y)))
-        return points
-
     def ease(self, t):
         if not self.easing:
             return t
         return 1 - (1 - t) ** 3
 
-    def prepare_background(self):
-        if not self.use_online_map:
-            return None
-
-        print("Fetching aligned map context background layer from OpenStreetMap...")
-        pil_image = self.context.render_pillow(self.width, self.height)
-
-        # Convert Image back to OpenCV array standard (RGBA)
-        cv_img = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2RGBA)
-        return cv_img
-
-    def background(self):
-        if self.cached_bg is not None:
-            return self.cached_bg.copy()
-        return np.zeros((self.height, self.width, 4), dtype=np.uint8)
-
     def render_frame(self, t):
         frame_idx = min(int(round(t * self.fps)), len(self.frame_distances) - 1)
         target_dist = self.frame_distances[frame_idx]
 
-        visible = []
+        # Extract current moving position coords
+        current_lat, current_lon = self.get_coord_at_distance(target_dist)
+        current_center = staticmaps.create_latlng(current_lat, current_lon)
+
+        if self.flyover:
+            # Set the camera view directly centered over the current track cursor position
+            transformer = staticmaps.Transformer(
+                self.width, self.height, self.flyover_zoom, current_center, self.tile_provider.tile_size()
+            )
+            # Map full trace coordinates layout points on this frame's perspective space
+            frame_points = []
+            for lat, lon in self.coords:
+                x, y = transformer.ll2pixel(staticmaps.create_latlng(lat, lon))
+                frame_points.append((int(x), int(y)))
+        else:
+            transformer = self.transformer
+            frame_points = self.points
+
+        # Slice the visible portion of the track up to the current distance
+        visible_points = []
         for i, d in enumerate(self.distances):
             if d <= target_dist:
-                visible.append(self.points[i])
+                visible_points.append(frame_points[i])
             else:
+                # Interpolate the exact cutting pixel edge point
+                lat_edge, lon_edge = self.get_coord_at_distance(target_dist)
+                x_edge, y_edge = transformer.ll2pixel(staticmaps.create_latlng(lat_edge, lon_edge))
+                visible_points.append((int(x_edge), int(y_edge)))
                 break
 
-        if len(visible) < 2:
-            visible = self.points[:2]
+        if len(visible_points) < 2:
+            visible_points = frame_points[:2]
 
-        frame = self.background()
+        # Fetch and stitch the custom tile window viewport configuration
+        if self.use_online_map:
+            if self.flyover:
+                # Update persistent context metrics
+                self.context.set_center(current_center)
+                self.context.set_zoom(self.flyover_zoom)
+            pil_image = self.context.render_pillow(self.width, self.height)
+            frame = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2RGBA)
+        else:
+            frame = np.zeros((self.height, self.width, 4), dtype=np.uint8)
 
-        if len(visible) > 1:
-            cv2.polylines(frame, [np.array(visible)], False, self.line_color, self.line_width, lineType=cv2.LINE_AA)
+        # Draw the trailing partial path track vector overlay
+        if len(visible_points) > 1:
+            cv2.polylines(frame, [np.array(visible_points)], False, self.line_color, self.line_width,
+                          lineType=cv2.LINE_AA)
 
-        if visible:
-            x, y = visible[-1]
-            cv2.circle(frame, (x, y), self.line_width + 2, self.line_color, -1, lineType=cv2.LINE_AA)
+        # Draw the target trace cursor dot directly over the map center
+        cx, cy = visible_points[-1]
+        cv2.circle(frame, (cx, cy), self.line_width + 4, self.line_color, -1, lineType=cv2.LINE_AA)
 
-        for mtype, (x, y), trigger_dist in self.marker_points:
-            if target_dist >= trigger_dist:
-                radius = 12 if mtype in ("start", "end") else 10
-                cv2.circle(frame, (x, y), radius, (255, 255, 255, 255), -1, lineType=cv2.LINE_AA)
-                cv2.circle(frame, (x, y), radius, (0, 0, 0, 255), 2, lineType=cv2.LINE_AA)
+        # Render custom markers if they fall inside our active zoom window dimensions
+        for lat, lon, *_ in self.custom_markers:
+            mx, my = transformer.ll2pixel(staticmaps.create_latlng(lat, lon))
+            if 0 <= mx <= self.width and 0 <= my <= self.height:
+                cv2.circle(frame, (int(mx), int(my)), 10, (255, 255, 255, 255), -1, lineType=cv2.LINE_AA)
+                cv2.circle(frame, (int(mx), int(my)), 10, (0, 0, 0, 255), 2, lineType=cv2.LINE_AA)
 
         return frame
 
@@ -255,6 +231,10 @@ class GPXOverlayRenderer:
             frame = self.render_frame(t)
             process.stdin.write(frame.tobytes())
 
+            # Progress tracker
+            if (i + 1) % 10 == 0 or i == total_frames - 1:
+                print(f"Processing frame {i + 1}/{total_frames} ({(i + 1) / total_frames * 100:.1f}%)")
+
         process.stdin.close()
         process.wait()
         print(f"Render Complete → {self.output_path}")
@@ -268,11 +248,12 @@ if __name__ == "__main__":
         height=1920,
         fps=30,
         duration=10,
-        line_color=(0, 102, 100, 255),  # Clear blue line
+        line_color=(0, 102, 255, 255),
         line_width=6,
-        margin=150,
         use_online_map=True,
         easing=True,
         custom_markers=custom_markers,
+        flyover=True,
+        flyover_zoom=14
     )
     renderer.render()
