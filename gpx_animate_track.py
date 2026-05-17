@@ -30,7 +30,7 @@ class GPXOverlayRenderer:
             line_color=(255, 255, 255, 255),  # BGRA
             line_width=6,
             margin=100,
-            use_online_map=True,  # NEW: Toggle to automatically pull maps online
+            use_online_map=True,  # Toggle to automatically pull maps online
             easing=True,
             custom_markers=None
     ):
@@ -48,43 +48,43 @@ class GPXOverlayRenderer:
 
         self.coords = self.load_gpx()
 
-        # Geographically compute boundaries
-        self.lats = [c[0] for c in self.coords]
-        self.lons = [c[1] for c in self.coords]
-        self.min_lat, self.max_lat = min(self.lats), max(self.lats)
-        self.min_lon, self.max_lon = min(self.lons), max(self.lons)
-
-        # Build map scaling matrices
-        self.scale, self.offset_x, self.offset_y = self.calculate_map_scales()
-
-        self.points = self.project_points()
+        # Build map distance arrays
         self.distances = self.compute_distances()
         self.total_distance = self.distances[-1]
+
+        # Initialize background canvas context to query pixel projection metrics
+        self.context = staticmaps.Context()
+        self.context.set_tile_provider(staticmaps.tile_provider_OSM)
+
+        # Feed the coordinates to context so it can compute bounds automatically
+        gpx_line = staticmaps.Line(
+            [staticmaps.create_latlng(lat, lon) for lat, lon in self.coords],
+            color=staticmaps.TRANSPARENT,
+            width=0
+        )
+        self.context.add_object(gpx_line)
+
+        # Compute layout metrics using the proper public methods
+        center, zoom = self.context.determine_center_zoom(self.width - 2 * self.margin, self.height - 2 * self.margin)
+
+        # Fix: Fetch tile_size cleanly from the explicit tile provider object
+        self.transformer = staticmaps.Transformer(
+            self.width,
+            self.height,
+            zoom,
+            center,
+            staticmaps.tile_provider_OSM.tile_size()
+        )
+
+        # Map pixel tracks directly using the exact underlying Web Mercator projections
+        self.points = self.project_points()
 
         self.custom_markers = custom_markers or []
         self.marker_points = self.project_markers()
         self.frame_distances = self.precompute_frame_distances()
 
-        # Download or clear map canvas
+        # Cache structural background matrix
         self.cached_bg = self.prepare_background()
-
-    def calculate_map_scales(self):
-        lat_range = self.max_lat - self.min_lat or 1e-9
-        lon_range = self.max_lon - self.min_lon or 1e-9
-
-        usable_w = self.width - 2 * self.margin
-        usable_h = self.height - 2 * self.margin
-
-        scale_x = usable_w / lon_range
-        scale_y = usable_h / lat_range
-        scale = min(scale_x, scale_y)
-
-        map_w = lon_range * scale
-        map_h = lat_range * scale
-
-        offset_x = (self.width - map_w) / 2
-        offset_y = (self.height - map_h) / 2
-        return scale, offset_x, offset_y
 
     def compute_distances(self):
         d = [0]
@@ -178,10 +178,13 @@ class GPXOverlayRenderer:
         return R * c
 
     def project_points(self):
+        """
+        Uses staticmaps internal mercator transformer to map coordinates to pixels perfectly.
+        """
         points = []
         for lat, lon in self.coords:
-            x = (lon - self.min_lon) * self.scale + self.offset_x
-            y = (self.max_lat - lat) * self.scale + self.offset_y
+            latlng = staticmaps.create_latlng(lat, lon)
+            x, y = self.transformer.ll2pixel(latlng)
             points.append((int(x), int(y)))
         return points
 
@@ -191,33 +194,14 @@ class GPXOverlayRenderer:
         return 1 - (1 - t) ** 3
 
     def prepare_background(self):
-        """
-        Calculates geographic context bounding rules, contacts an open-tile server,
-        stitches the canvas pieces locally, and matches our pipeline's precise size rules.
-        """
         if not self.use_online_map:
             return None
 
-        print("Fetching map background layout context from OpenStreetMap...")
-        context = staticmaps.Context()
-        context.set_tile_provider(staticmaps.tile_provider_OSM)
-
-        # Feed the geographic bounding points into the stitching compiler
-        gpx_line = staticmaps.Line(
-            [staticmaps.create_latlng(lat, lon) for lat, lon in self.coords],
-            color=staticmaps.TRANSPARENT,  # Keep the backdrop trace clear so our engine can animate it
-            width=0
-        )
-        context.add_object(gpx_line)
-
-        # Render the map to a memory buffer at our correct resolution specifications
-        pil_image = context.render_pillow(self.width, self.height)
+        print("Fetching aligned map context background layer from OpenStreetMap...")
+        pil_image = self.context.render_pillow(self.width, self.height)
 
         # Convert Image back to OpenCV array standard (RGBA)
         cv_img = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2RGBA)
-
-        # Re-verify alignment projection factors based on the exact stitched canvas window layout
-        # This keeps the trace path perfectly locked on the map roads!
         return cv_img
 
     def background(self):
@@ -284,10 +268,10 @@ if __name__ == "__main__":
         height=1920,
         fps=30,
         duration=10,
-        line_color=(0, 102, 255, 255),  # Switched to clear blue line so it stands out brightly on the map background
+        line_color=(0, 102, 100, 255),  # Clear blue line
         line_width=6,
-        margin=150,  # Increased margin to give the stitched map room to frame everything beautifully
-        use_online_map=True,  # True: Auto-fetches OpenStreetMap / False: transparent alpha channel output
+        margin=150,
+        use_online_map=True,
         easing=True,
         custom_markers=custom_markers,
     )
