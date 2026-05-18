@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import ffmpeg
 import os
+import sys
 import requests
 from PIL import Image
 
@@ -16,7 +17,7 @@ custom_markers = [
 
 class GPXOverlayRenderer:
     """
-    GPX → Animated track video with an optimized dynamic camera tracking (flyover) effect.
+    GPX → Animated track video with an elastic camera tracking (parallax flyover) effect.
     """
 
     def __init__(
@@ -32,8 +33,9 @@ class GPXOverlayRenderer:
             use_online_map=True,
             easing=True,
             custom_markers=None,
-            flyover=True,  # Toggle to enable/disable camera tracking flyover
-            flyover_zoom=14  # Fixed high zoom level for close-up tracking (typically 13-16)
+            flyover=True,
+            flyover_zoom=14,
+            camera_lag=0.12  # NEW: 1.0 = locked rigid. Lower values (0.05 - 0.2) create a lazy, fluid camera lag
     ):
         self.gpx_path = gpx_path
         self.output_path = output_path
@@ -47,6 +49,7 @@ class GPXOverlayRenderer:
         self.easing = easing
         self.flyover = flyover
         self.flyover_zoom = flyover_zoom
+        self.camera_lag = camera_lag
 
         self.coords = self.load_gpx()
 
@@ -61,8 +64,6 @@ class GPXOverlayRenderer:
             max_zoom=20
         )
 
-        # FIX: Instantiate cleanly without arguments.
-        # Caching happens automatically in your user home directory.
         self.context = staticmaps.Context()
         self.context.set_tile_provider(self.tile_provider)
 
@@ -80,7 +81,10 @@ class GPXOverlayRenderer:
             self.points = [self.transformer.ll2pixel(staticmaps.create_latlng(lat, lon)) for lat, lon in self.coords]
 
         self.custom_markers = custom_markers or []
+
+        # Precompute target metrics along with the camera paths
         self.frame_distances = self.precompute_frame_distances()
+        self.camera_centers = self.precompute_camera_paths()
 
     def compute_distances(self):
         d = [0]
@@ -124,6 +128,26 @@ class GPXOverlayRenderer:
 
         return [get_moving_dist(i) for i in range(total_frames)]
 
+    def precompute_camera_paths(self):
+        """NEW: Pre-calculates an elastic trailing camera path path based on cursor inertia."""
+        total_frames = int(self.duration * self.fps)
+        centers = []
+
+        # Start camera exactly at the beginning point
+        cam_lat, cam_lon = self.coords[0]
+
+        for i in range(total_frames):
+            target_dist = self.frame_distances[i]
+            cursor_lat, cursor_lon = self.get_coord_at_distance(target_dist)
+
+            if i > 0:
+                # Linearly interpolate towards cursor using our lag dampener coefficient
+                cam_lat = cam_lat * (1 - self.camera_lag) + cursor_lat * self.camera_lag
+                cam_lon = cam_lon * (1 - self.camera_lag) + cursor_lon * self.camera_lag
+
+            centers.append((cam_lat, cam_lon))
+        return centers
+
     def load_gpx(self):
         tree = ET.parse(self.gpx_path)
         root = tree.getroot()
@@ -155,11 +179,13 @@ class GPXOverlayRenderer:
         target_dist = self.frame_distances[frame_idx]
 
         # Extract current moving position coords
-        current_lat, current_lon = self.get_coord_at_distance(target_dist)
-        current_center = staticmaps.create_latlng(current_lat, current_lon)
+        cursor_lat, cursor_lon = self.get_coord_at_distance(target_dist)
 
         if self.flyover:
-            # Set the camera view directly centered over the current track cursor position
+            # FIX: Fetch the lazy camera center coordinate instead of the literal cursor position
+            cam_lat, cam_lon = self.camera_centers[frame_idx]
+            current_center = staticmaps.create_latlng(cam_lat, cam_lon)
+
             transformer = staticmaps.Transformer(
                 self.width, self.height, self.flyover_zoom, current_center, self.tile_provider.tile_size()
             )
@@ -190,8 +216,9 @@ class GPXOverlayRenderer:
         # Fetch and stitch the custom tile window viewport configuration
         if self.use_online_map:
             if self.flyover:
-                # Update persistent context metrics
-                self.context.set_center(current_center)
+                # Update persistent context to match our lagging camera coordinate anchor
+                cam_lat, cam_lon = self.camera_centers[frame_idx]
+                self.context.set_center(staticmaps.create_latlng(cam_lat, cam_lon))
                 self.context.set_zoom(self.flyover_zoom)
             pil_image = self.context.render_pillow(self.width, self.height)
             frame = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2RGBA)
@@ -203,9 +230,10 @@ class GPXOverlayRenderer:
             cv2.polylines(frame, [np.array(visible_points)], False, self.line_color, self.line_width,
                           lineType=cv2.LINE_AA)
 
-        # Draw the target trace cursor dot directly over the map center
-        cx, cy = visible_points[-1]
-        cv2.circle(frame, (cx, cy), self.line_width + 4, self.line_color, -1, lineType=cv2.LINE_AA)
+        # Draw the target trace cursor dot directly over its active localized coordinate space
+        # FIX: The pixel position will now dynamically wander across the viewport!
+        cx, cy = transformer.ll2pixel(staticmaps.create_latlng(cursor_lat, cursor_lon))
+        cv2.circle(frame, (int(cx), int(cy)), self.line_width + 4, self.line_color, -1, lineType=cv2.LINE_AA)
 
         # Render custom markers if they fall inside our active zoom window dimensions
         for lat, lon, *_ in self.custom_markers:
@@ -226,18 +254,25 @@ class GPXOverlayRenderer:
         )
 
         total_frames = int(self.duration * self.fps)
+        print("\nStarting video render loop...")
+
         for i in range(total_frames):
             t = i / self.fps
             frame = self.render_frame(t)
             process.stdin.write(frame.tobytes())
 
-            # Progress tracker
-            if (i + 1) % 10 == 0 or i == total_frames - 1:
-                print(f"Processing frame {i + 1}/{total_frames} ({(i + 1) / total_frames * 100:.1f}%)")
+            current_frame = i + 1
+            percent = (current_frame / total_frames) * 100
+            bar_length = 30
+            filled_length = int(round(bar_length * current_frame / float(total_frames)))
+            bar = '█' * filled_length + '░' * (bar_length - filled_length)
+
+            sys.stdout.write(f"\rProcessing: [{bar}] {current_frame}/{total_frames} ({percent:.1f}%)")
+            sys.stdout.flush()
 
         process.stdin.close()
         process.wait()
-        print(f"Render Complete → {self.output_path}")
+        print(f"\n\nRender Complete → {self.output_path}\n")
 
 
 if __name__ == "__main__":
@@ -254,6 +289,8 @@ if __name__ == "__main__":
         easing=True,
         custom_markers=custom_markers,
         flyover=True,
-        flyover_zoom=14
+        flyover_zoom=14,
+        camera_lag=0.12
+        # Play with this! Lower value (e.g. 0.08) = more cursor movement. Higher value (e.g. 0.25) = tighter tracking.
     )
     renderer.render()
