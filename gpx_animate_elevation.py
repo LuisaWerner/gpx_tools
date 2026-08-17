@@ -273,8 +273,8 @@ class GPXElevationRenderer:
 
 if __name__ == "__main__":
     renderer = GPXElevationRenderer(
-        gpx_path="cols.gpx",
-        output_path="gpx_elevation.mov",
+        gpx_path="belledonne.gpx",
+        output_path="belledonne.mov",
         width=1080,
         height=1920,
         fps=30,

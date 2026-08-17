@@ -2,7 +2,7 @@ import xml.etree.ElementTree as ET
 import cv2
 import numpy as np
 import staticmaps
-from PIL import Image  # Used for Instagram-compatible PNG encoding
+from PIL import Image
 
 custom_markers = [
     (45.432, 6.380, "Col de la Madeleine")
@@ -11,29 +11,38 @@ custom_markers = [
 
 class GPXStaticRenderer:
     """
-    GPX → Transparent Static PNG overlay optimized for Instagram Stories/Reels.
+    GPX → Ultra-High-Resolution Transparent Static PNG overlay optimized for production edits.
+    Uses sub-pixel fixed-point rendering to eliminate jagged edges and maximize anti-aliasing quality.
     """
 
     def __init__(
             self,
             gpx_path,
-            output_path="gpx_instagram_overlay.png",
+            output_path="mini_marmotte_overlay.png",
             width=1080,
             height=1920,
+            scale=4,  # Bumped to 4x scale (4320 x 7680 Ultra-HD canvas)
             line_color=(255, 255, 255, 255),  # BGRA (White)
-            line_width=6,
+            line_width=6,  # Base width, scales automatically
             margin=100,
-            use_online_map=False,  # MUST BE FALSE FOR TRANSPARENT OVERLAY
+            use_online_map=False,
             custom_markers=None
     ):
         self.gpx_path = gpx_path
         self.output_path = output_path
-        self.width = width
-        self.height = height
+
+        # Apply the scaling factor to dimensions and margins
+        self.width = width * scale
+        self.height = height * scale
+        self.line_width = line_width * scale
+        self.margin = margin * scale
+
         self.line_color = line_color
-        self.line_width = line_width
-        self.margin = margin
         self.use_online_map = use_online_map
+
+        # Sub-pixel rendering configurations (2^4 = 16 positions per pixel for hyper-smooth curves)
+        self.shift = 4
+        self.sub_scale = 1 << self.shift
 
         self.coords = self.load_gpx()
 
@@ -56,6 +65,11 @@ class GPXStaticRenderer:
             center,
             staticmaps.tile_provider_OSM.tile_size()
         )
+
+        # Base marker configurations (unscaled for sub-pixel layer handling)
+        self.marker_radius_large = 12 * scale
+        self.marker_radius_small = 10 * scale
+        self.marker_border_thickness = max(2, 1 * scale)
 
         self.points = self.project_points()
         self.custom_markers = custom_markers or []
@@ -84,11 +98,17 @@ class GPXStaticRenderer:
         return R * c
 
     def project_points(self):
+        """
+        Projects map coordinates directly into scaled up sub-pixel precision integers.
+        """
         points = []
         for lat, lon in self.coords:
             latlng = staticmaps.create_latlng(lat, lon)
             x, y = self.transformer.ll2pixel(latlng)
-            points.append((int(x), int(y)))
+            # Scale coordinates up by fixed point factor
+            sub_x = int(round(x * self.sub_scale))
+            sub_y = int(round(y * self.sub_scale))
+            points.append((sub_x, sub_y))
         return points
 
     def project_markers(self):
@@ -115,44 +135,62 @@ class GPXStaticRenderer:
     def get_background(self):
         if self.cached_bg is not None:
             return self.cached_bg.copy()
-        # Creates a 100% transparent canvas (Alpha channel = 0)
         return np.zeros((self.height, self.width, 4), dtype=np.uint8)
 
     def render(self):
         frame = self.get_background()
 
-        # Draw the static line
+        # Render paths using fixed-point subpixel positions for flawlessly smooth vector curves
         if len(self.points) > 1:
-            cv2.polylines(frame, [np.array(self.points)], False, self.line_color, self.line_width, lineType=cv2.LINE_AA)
+            cv2.polylines(
+                frame,
+                [np.array(self.points, dtype=np.int32)],
+                False,
+                self.line_color,
+                self.line_width,
+                lineType=cv2.LINE_AA,
+                shift=self.shift
+            )
 
-        # Draw markers
+        # Render markers using fixed-point radius adjustments
         for mtype, (x, y) in self.marker_points:
-            radius = 12 if mtype in ("start", "end") else 10
-            cv2.circle(frame, (x, y), radius, (255, 255, 255, 255), -1, lineType=cv2.LINE_AA)
-            cv2.circle(frame, (x, y), radius, (0, 0, 0, 255), 2, lineType=cv2.LINE_AA)
+            radius = self.marker_radius_large if mtype in ("start", "end") else self.marker_radius_small
+            sub_radius = int(round(radius * self.sub_scale))
 
-        # --- FIX FOR INSTAGRAM TRANSPARENCY ---
-        # 1. Convert from OpenCV standard (BGRA) to Pillow standard (RGBA)
+            # Filled White Solid Core
+            cv2.circle(frame, (x, y), sub_radius, (255, 255, 255, 255), -1, lineType=cv2.LINE_AA, shift=self.shift)
+            # Crisp Black Outline Stroke
+            cv2.circle(
+                frame,
+                (x, y),
+                sub_radius,
+                (0, 0, 0, 255),
+                self.marker_border_thickness,
+                lineType=cv2.LINE_AA,
+                shift=self.shift
+            )
+
+        # Convert OpenCV (BGRA) matrix over to Pillow (RGBA) format
         rgba_frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGBA)
-
-        # 2. Convert array to PIL Image object
         pil_img = Image.fromarray(rgba_frame)
 
-        # 3. Save using Pillow's reliable PNG encoder
-        pil_img.save(self.output_path, format="PNG")
-        print(f"Instagram-ready PNG saved to → {self.output_path}")
+        # Save with full PNG bit depth optimizations enabled
+        pil_img.save(self.output_path, format="PNG", optimize=True, compress_level=9)
+        print(f"Master-quality export saved to → {self.output_path} ({self.width}x{self.height} px)")
 
-name = "day2"
+
+name = "rhoen"
 if __name__ == "__main__":
     renderer = GPXStaticRenderer(
         gpx_path=f"{name}.gpx",
         output_path=f"{name}.png",
         width=1080,
         height=1920,
-        line_color=(255, 255, 255, 255),  # Solid white line
-        line_width=6,
+        scale=4,  # Change to 5 or 6 if you need absolutely extreme canvas sizing
+        line_color=(255, 255, 255, 255),
+        line_width=5,
         margin=150,
-        use_online_map=False,  # Must stay False for transparency
+        use_online_map=False,
         custom_markers=custom_markers,
     )
     renderer.render()

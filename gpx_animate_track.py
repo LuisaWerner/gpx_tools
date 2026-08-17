@@ -10,7 +10,7 @@ from PIL import Image
 import staticmaps
 
 custom_markers = [
-    (45.432, 6.380, "Col de la Madeleine")
+    # (45.432, 6.380, "Col de la Madeleine")
 ]
 
 
@@ -262,16 +262,16 @@ class GPXOverlayRenderer:
 
 if __name__ == "__main__":
     renderer = GPXOverlayRenderer(
-        gpx_path="cols.gpx",
-        output_path="gpx_overlay.mov",
+        gpx_path="aixlesbains.gpx",
+        output_path="aixlesbains.mov",
         width=1080,
         height=1920,
         fps=30,
         duration=10,
-        line_color=(0, 102, 100, 255),  # Clear blue line
-        line_width=6,
+        line_color=(255, 255, 255, 255),  # Clear blue line
+        line_width=5,
         margin=150,
-        use_online_map=True,
+        use_online_map=False,
         easing=True,
         custom_markers=custom_markers,
     )
